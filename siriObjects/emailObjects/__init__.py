@@ -1,24 +1,11 @@
-from siriObjects.baseObjects import AceObject, ClientBoundCommand, ServerBoundCommand
-from siriObjects.uiObjects import AddViews, AssistantUtteranceView, Snippet
+from siriObjects.baseObjects import ClientBoundCommand, ServerBoundCommand
 from siriObjects.systemObjects import DomainObject
+from siriObjects.uiObjects import UISnippet
 
-
-class Email(AceObject):
-    def __init__(self, group="com.apple.ace.email"):
-        super(Email, self).__init__("Email", group)
-        self.label = None # string
-        self.favoriteFacetime = None # number
-        self.emailAddress = None # string
-
-    def to_plist(self):
-        self.add_property('label')
-        self.add_property('favoriteFacetime')
-        self.add_property('emailAddress')
-        return super(Email, self).to_plist()
 
 class EmailEmail(DomainObject):
     def __init__(self):
-        super(EmailEmail, self).__init__("com.apple.ace.email")
+        super(EmailEmail, self).__init__("com.apple.ace.email", clazz="Email")
         self.type = None # string
         self.timeZoneId = None # string
         self.subject = None # string
@@ -48,7 +35,7 @@ class EmailEmail(DomainObject):
         return super(EmailEmail, self).to_plist()
 
 class EmailRetrieve(ClientBoundCommand):
-    def __init__(self, refid):
+    def __init__(self, refId):
         super(EmailRetrieve, self).__init__("Retrieve", "com.apple.ace.email", None, refId)
         self.requestedHeaders = None # array
         self.identifiers = None # array
@@ -98,9 +85,9 @@ class EmailSearchCompleted(ServerBoundCommand):
         self.emailResults = None #array
         super(EmailSearchCompleted, self).__init__(plist)
 
-class EmailSnippet(Snippet):
+class EmailSnippet(UISnippet):
     def __init__(self):
-        super(EmailSnippet, self).__init__("com.apple.ace.email")
+        super(EmailSnippet, self).__init__(group="com.apple.ace.email")
         self.emails = None # array
 
     def to_plist(self):

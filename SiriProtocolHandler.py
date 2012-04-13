@@ -11,8 +11,10 @@ from siriObjects.speechObjects import Phrase, Recognition, SpeechRecognized, \
     StartSpeechDictation, FinishSpeech, SpeechPacket
 from siriObjects.systemObjects import StartRequest, SendCommands, CancelRequest, \
     CancelSucceeded, GetSessionCertificate, GetSessionCertificateResponse, \
-    CreateSessionInfoRequest, CommandFailed
-from siriObjects.uiObjects import AddViews, AssistantUtteranceView, Button
+    CreateSessionInfoRequest, CommandFailed, RollbackRequest, CreateAssistant, \
+    AssistantCreated, SetAssistantData, LoadAssistant, AssistantNotFound, \
+    AssistantLoaded, DestroyAssistant, AssistantDestroyed
+from siriObjects.uiObjects import UIAddViews, UIAssistantUtteranceView, UIButton
 import PluginManager
 import flac
 import json
@@ -20,8 +22,8 @@ import pprint
 import speex
 import sqlite3
 import time
-import uuid
 import twisted
+import uuid
 
        
 
@@ -54,9 +56,19 @@ class SiriProtocolHandler(Siri):
             self.timeoutschedule.cancel()
         except:
             pass
+        if self.current_google_request != None:
+                self.current_google_request.cancel()
+        #ensure all decoder/encoder attemps are closed
+        for key in self.speech.keys():
+            (decoder, encoder, _) = self.speech[key]
+            if decoder:
+                decoder.destroy()
+            if encoder:
+                encoder.finish()
+                encoder.destroy()
+        del self.speech
         self.current_running_plugin = None
         self.dbConnection = None
-        self.speech = None
         self.httpClient = None
         Siri.connectionLost(self, reason)
     
@@ -71,6 +83,13 @@ class SiriProtocolHandler(Siri):
         self.current_google_request = None
         if (body != None):
             googleAnswer = json.loads(body)
+            for i in xrange(0,len(googleAnswer['hypotheses'])-1):
+                utterance = googleAnswer['hypotheses'][i]['utterance']
+                if len(utterance) == 1:
+                    utterance = utterance.upper()
+                else:
+                    utterance = utterance[0].upper() + utterance[1:]
+                googleAnswer['hypotheses'][i]['utterance'] = utterance
             self.process_recognized_speech(googleAnswer, requestId, dictation)
         else:
             self.send_object(SpeechFailure(requestId, "No connection to Google possible"))
@@ -86,10 +105,6 @@ class SiriProtocolHandler(Siri):
         possible_matches = googleJson['hypotheses']
         if len(possible_matches) > 0:
             best_match = possible_matches[0]['utterance']
-            if len(best_match) == 1:
-                best_match = best_match.upper()
-            else:
-                best_match = best_match[0].upper() + best_match[1:]
             best_match_confidence = possible_matches[0]['confidence']
             self.logger.info(u"Best matching result: \"{0}\" with a confidence of {1}%".format(best_match, round(float(best_match_confidence) * 100, 2)))
             # construct a SpeechRecognized
@@ -110,11 +125,15 @@ class SiriProtocolHandler(Siri):
                         self.current_running_plugin.start()
                     else:
                         self.send_object(recognized)
-                        view = AddViews(requestId)
+                        view = UIAddViews(requestId)
                         errorText = SiriProtocolHandler.__not_recognized[self.assistant.language] if self.assistant.language in SiriProtocolHandler.__not_recognized else SiriProtocolHandler.__not_recognized["en-US"]
-                        view.views += [AssistantUtteranceView(errorText.format(best_match), errorText.format(best_match))]
+                        errorView = UIAssistantUtteranceView()
+                        errorView.text = errorText.format(best_match)
+                        errorView.speakableText = errorText.format(best_match)
+                        view.views = [errorView]
                         websearchText = SiriProtocolHandler.__websearch[self.assistant.language] if self.assistant.language in SiriProtocolHandler.__websearch else SiriProtocolHandler.__websearch["en-US"]
-                        button = Button(text=websearchText)
+                        button = UIButton()
+                        button.text = websearchText
                         cmd = SendCommands()
                         cmd.commands = [StartRequest(utterance=u"^webSearchQuery^=^{0}^^webSearchConfirmation^=^Yes^".format(best_match))]
                         button.commands = [cmd]
@@ -209,16 +228,20 @@ class SiriProtocolHandler(Siri):
                 (decoder, encoder, dictation) = self.speech[finishSpeech.refId]
                 if decoder:
                     decoder.destroy()
-                encoder.finish()
-                flacBin = encoder.getBinary()
-                encoder.destroy()
+                flacBin = None
+                if encoder:
+                    encoder.finish()
+                    flacBin = encoder.getBinary()
+                    encoder.destroy()
                 del self.speech[finishSpeech.refId]
-                
-                self.logger.info("Sending flac to google for recognition")
-                try:
-                    self.current_google_request = self.httpClient.make_google_request(flacBin, finishSpeech.refId, dictation, language=self.assistant.language, allowCurses=True)
-                except (AttributeError, TypeError):
-                    self.logger.warning("Unable to find language record for this assistant. Try turning Siri off and then back on.")
+                if flacBin != None:
+                    self.logger.info("Sending flac to google for recognition")
+                    try:
+                        self.current_google_request = self.httpClient.make_google_request(flacBin, finishSpeech.refId, dictation, language=self.assistant.language, allowCurses=True)
+                    except (AttributeError, TypeError):
+                        self.logger.warning("Unable to find language record for this assistant. Try turning Siri off and then back on.")
+                else:
+                    self.logger.info("There was no speech")
             else:
                 self.logger.debug("Got a finish speech packet that did not match any current request")
                 
@@ -228,6 +251,12 @@ class SiriProtocolHandler(Siri):
             self.logger.debug("Should cancel current request")
             cancelRequest = CancelRequest(plist)
             if cancelRequest.refId in self.speech:
+                (decoder, encoder, dictation) = self.speech[cancelRequest.refId]
+                if decoder:
+                    decoder.destroy()
+                if encoder:
+                    encoder.finish()
+                    encoder.destory()
                 del self.speech[cancelRequest.refId]
             if self.current_google_request != None:
                 self.current_google_request.cancel()
@@ -243,6 +272,9 @@ class SiriProtocolHandler(Siri):
                     self.current_running_plugin._abortPluginRun()     
             
             self.send_object(CancelSucceeded(cancelRequest.aceId))
+            
+        elif ObjectIsCommand(plist, RollbackRequest):
+            pass
 
         elif ObjectIsCommand(plist, GetSessionCertificate):
             getSessionCertificate = GetSessionCertificate(plist)
@@ -261,7 +293,8 @@ class SiriProtocolHandler(Siri):
 
             #self.send_plist({"class":"SessionValidationFailed", "properties":{"errorCode":"UnsupportedHardwareVersion"}, "aceId": str(uuid.uuid4()), "refId":plist['aceId'], "group":"com.apple.ace.system"})
             
-        elif plist['class'] == 'CreateAssistant':
+        elif ObjectIsCommand(plist, CreateAssistant):
+            createAssistant = CreateAssistant(plist)
             #create a new assistant
             helper = Assistant()     
             helper.assistantId = str.upper(str(uuid.uuid4())) 
@@ -275,47 +308,60 @@ class SiriProtocolHandler(Siri):
             c.close()
             if noError:
                 self.assistant = helper
-                self.send_plist({"class": "AssistantCreated", "properties": {"speechId": str(uuid.uuid4()), "assistantId": helper.assistantId}, "group":"com.apple.ace.system", "callbacks":[], "aceId": str(uuid.uuid4()), "refId": plist['aceId']})
+                assiCreatedCMD = AssistantCreated(createAssistant.aceId)
+                assiCreatedCMD.assistantId = helper.assistantId
+                assiCreatedCMD.speechId = str(uuid.uuid4())
+                self.send_object(assiCreatedCMD)
             else:
-                self.send_plist({"class":"CommandFailed", "properties": {"reason":"Database error", "errorCode":2, "callbacks":[]}, "aceId": str(uuid.uuid4()), "refId": plist['aceId'], "group":"com.apple.ace.system"})
+                cmdFailed = CommandFailed(createAssistant.aceId)
+                cmdFailed.reason = "Database Error"
+                cmdFailed.errorCode = 2
+                self.send_object(cmdFailed)
             
-        elif plist['class'] == 'SetAssistantData':
+        elif ObjectIsCommand(plist, SetAssistantData):
+            setAssistantData = SetAssistantData(plist)
             # fill assistant 
             if self.assistant != None:
                 try:
                     c = self.dbConnection.cursor()
-                    objProperties = plist['properties'] 
-                    self.assistant.censorSpeech = objProperties['censorSpeech']
-                    self.assistant.timeZoneId = objProperties['timeZoneId']
-                    self.assistant.language = objProperties['language']
-                    self.assistant.region = objProperties['region']
+                    assi_id = self.assistant.assistantId
+                    self.assistant.initializeFromPlist(setAssistantData.to_plist())
+                    self.assistant.assistantId = assi_id
                     #Record the user firstName and nickName                    
                     try:                        
-                        self.assistant.firstName = objProperties["meCards"][0]["properties"]["firstName"].encode("utf-8")
-                    except KeyError:
+                        self.assistant.firstName = self.assistant.meCards[0].firstName.encode("utf-8")
+                    except:
                         self.assistant.firstName = u''                        
                     try:                        
-                        self.assistant.nickName = objProperties["meCards"][0]["properties"]["nickName"].encode("utf-8")       
-                    except KeyError:
+                        self.assistant.nickName = self.assistant.meCards[0].nickName.encode("utf-8")       
+                    except:
                         self.assistant.nickName = u''
                     #Done recording
                     c.execute("update assistants set assistant = ? where assistantId = ?", (self.assistant, self.assistant.assistantId))
                     self.dbConnection.commit()
                     c.close()
                 except:
-                    self.send_plist({"class":"CommandFailed", "properties": {"reason":"Database error", "errorCode":2, "callbacks":[]}, "aceId": str(uuid.uuid4()), "refId": plist['aceId'], "group":"com.apple.ace.system"})
-                    self.logger.error("Database Error on setting assistant data")
+                    cmdFailed = CommandFailed(setAssistantData.aceId)
+                    cmdFailed.reason = "Database Error"
+                    cmdFailed.errorCode = 2
+                    self.send_object(cmdFailed)
+                    self.logger.exception("Database Error on setting assistant data")
             else:
-                self.send_plist({"class":"CommandFailed", "properties": {"reason":"Assistant to set data not found", "errorCode":2, "callbacks":[]}, "aceId": str(uuid.uuid4()), "refId": plist['aceId'], "group":"com.apple.ace.system"})
+                cmdFailed = CommandFailed(setAssistantData.aceId)
+                cmdFailed.reason = "Assistant to set data not found"
+                cmdFailed.errorCode = 2
+                self.send_object(cmdFailed)
                 self.logger.warning("Trying to set assistant data without having a valid assistant")
-        elif plist['class'] == 'LoadAssistant':
+                
+        elif ObjectIsCommand(plist, LoadAssistant):
+            loadAssistant = LoadAssistant(plist)
             try:
                 c = self.dbConnection.cursor()
-                c.execute("select assistant from assistants where assistantId = ?", (plist['properties']['assistantId'],))
+                c.execute("select assistant from assistants where assistantId = ?", (loadAssistant.assistantId,))
                 self.dbConnection.commit()
                 result = c.fetchone()
                 if result == None:
-                    self.send_plist({"class": "AssistantNotFound", "aceId":str(uuid.uuid4()), "refId":plist['aceId'], "group":"com.apple.ace.system"})
+                    self.send_object(AssistantNotFound(loadAssistant.aceId))
                     self.logger.warning("Assistant not found in database!!")                        
                 else:
                     self.assistant = result[0]
@@ -323,26 +369,40 @@ class SiriProtocolHandler(Siri):
                         self.logger.error ("No language is set for this assistant")                        
                         c.execute("delete from assistants where assistantId = ?", (plist['properties']['assistantId'],))
                         self.dbConnection.commit()
-                        self.send_plist({"class":"CommandFailed", "properties": {"reason":"Database error Assistant not found or language settings ", "errorCode":2, "callbacks":[]}, "aceId": str(uuid.uuid4()), "refId": plist['aceId'], "group":"com.apple.ace.system"})
+                        cmdFailed = CommandFailed(loadAssistant.aceId)
+                        cmdFailed.reason = "Database error Assistant not found or language settings"
+                        cmdFailed.errorCode = 2
+                        self.send_object(cmdFailed)
                     else:                        
-                        self.send_plist({"class": "AssistantLoaded", "properties": {"version": "20111216-32234-branches/telluride?cnxn=293552c2-8e11-4920-9131-5f5651ce244e", "requestSync":False, "dataAnchor":"removed"}, "aceId":str(uuid.uuid4()), "refId":plist['aceId'], "group":"com.apple.ace.system"})
+                        loaded = AssistantLoaded(loadAssistant.aceId)
+                        loaded.version = "20111216-32234-branches/telluride?cnxn=293552c2-8e11-4920-9131-5f5651ce244e"
+                        loaded.requestSync = False
+                        try:
+                            loaded.dataAnchor = self.assistant.anchor
+                        except:
+                            loaded.dataAnchor = "removed"
+                        self.send_object(loaded)
                 c.close()
             except:
-                self.send_plist({"class": "AssistantNotFound", "aceId":str(uuid.uuid4()), "refId":plist['aceId'], "group":"com.apple.ace.system"})
+                self.send_object(AssistantNotFound(loadAssistant.aceId))
                 self.logger.warning("Database error on fetching assistant")
                 
-        elif plist['class'] == 'DestroyAssistant':
+        elif ObjectIsCommand(plist, DestroyAssistant):
+            destroyAssistant = DestroyAssistant(plist)
             try:
                 c = self.dbConnection.cursor()
                 c.execute("delete from assistants where assistantId = ?", (plist['properties']['assistantId'],))
                 self.dbConnection.commit()
                 c.close()
-                self.send_plist({"class": "AssistantDestroyed", "properties": {"assistantId": plist['properties']['assistantId']}, "aceId":str(uuid.uuid4()), "refId":plist['aceId'], "group":"com.apple.ace.system"})
+                destroyed = AssistantDestroyed(destroyAssistant.aceId)
+                destroyed.assistantId = destroyAssistant.assistantId
+                self.send_object(destroyed)
             except:
-                self.send_plist({"class": "AssistantNotFound", "aceId":str(uuid.uuid4()), "refId":plist['aceId'], "group":"com.apple.ace.system"})
+                self.send_object(AssistantNotFound(destroyAssistant.aceId))
                 self.logger.error("Database error on deleting assistant")
                 
-        elif plist['class'] == 'StartRequest':
+        elif ObjectIsCommand(plist, StartRequest):
+            startRequest = StartRequest(plist)
             #this should also be handeled by special plugins, so lets call the plugin handling stuff
-            self.process_recognized_speech({'hypotheses': [{'utterance': plist['properties']['utterance'], 'confidence': 1.0}]}, plist['aceId'], False)
+            self.process_recognized_speech({'hypotheses': [{'utterance': startRequest.utterance, 'confidence': 1.0}]}, startRequest.aceId, False)
         pass
