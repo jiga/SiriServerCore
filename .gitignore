@@ -9,3 +9,5 @@ plugins.conf
 ca.pem
 server.crt
 server.key
+
+keys/cakey.pem
